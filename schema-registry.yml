@@ -1,0 +1,265 @@
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    meta.helm.sh/release-name: schema-registry
+    meta.helm.sh/release-namespace: kafka
+  labels:
+    app.kubernetes.io/instance: schema-registry
+    app.kubernetes.io/name: schema-registry
+  name: schema-registry-headless
+  namespace: kafka
+spec:
+  clusterIP: None
+  ports:
+  - name: http
+    port: 8081
+    protocol: TCP
+    targetPort: http
+  selector:
+    app.kubernetes.io/instance: schema-registry
+    app.kubernetes.io/name: schema-registry
+  sessionAffinity: None
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: schema-reg-cp-schema-registry
+  labels:
+    app.kubernetes.io/instance: schema-registry
+    app.kubernetes.io/name: schema-registry
+  namespace: kafka    
+spec:
+  ports:
+    - name: schema-registry
+      port: 8081
+    - name: metrics
+      port: 5556
+  selector:
+    app.kubernetes.io/instance: schema-registry
+    app.kubernetes.io/name: schema-registry
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kafka-schema-reg
+  namespace: kafka
+spec:
+  endpoints:
+  - interval: 5s
+    path: /metrics
+    port: metrics
+  jobLabel: kafka-schema-reg
+  namespaceSelector:
+    matchNames:
+    - kafka
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: schema-registry
+      app.kubernetes.io/name: schema-registry
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sch-registry
+  namespace: kafka
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: schema-registry
+      app.kubernetes.io/name: schema-registry
+  serviceName: schema-registry
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: schema-registry
+        app.kubernetes.io/name: schema-registry
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: schema-registry
+                  app.kubernetes.io/name: schema-registry
+              topologyKey: kubernetes.io/hostname
+            weight: 1
+      containers:
+      - name: prometheus-jmx-exporter
+        image: "solsson/kafka-prometheus-jmx-exporter@sha256:6f82e2b0464f50da8104acd7363fb9b995001ddff77d248379f8788e78946143"
+        imagePullPolicy: "IfNotPresent"
+        command:
+        - java
+        - -XX:+UnlockExperimentalVMOptions
+        - -XX:+UseCGroupMemoryLimitForHeap
+        - -XX:MaxRAMFraction=1
+        - -XshowSettings:vm
+        - -jar
+        - jmx_prometheus_httpserver.jar
+        - "5556"
+        - /etc/jmx-schema-registry/jmx-schema-registry-prometheus.yml
+        ports:
+        - containerPort: 5556
+        resources:
+          limits:
+            memory: 768Mi
+          requests:
+            cpu: 500m
+            memory: 512Mi
+        volumeMounts:
+        - name: jmx-config
+          mountPath: /etc/jmx-schema-registry          
+      - image: confluentinc/cp-schema-registry
+        name: sch-registry
+        env:
+        - name: MY_POD_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.name
+        - name: SCHEMA_REGISTRY_LISTENERS
+          value: http://0.0.0.0:8081
+        - name: SCHEMA_REGISTRY_AVRO_COMPATIBILY_LEVEL
+          value: backward
+        - name: SCHEMA_REGISTRY_HOST_NAME
+          value: $(MY_POD_NAME).schema-registry-headless.kafka.svc.cluster.local
+        - name: SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS
+          value: SASL_PLAINTEXT://kafka-kafka-0.kafka-kafka-brokers.kafka.svc:9092
+        - name: SCHEMA_REGISTRY_AUTHENTICATION_METHOD
+          value: BASIC
+        - name: SCHEMA_REGISTRY_AUTHENTICATION_REALM
+          value: "SchemaRegistry-Props"  
+        - name: SCHEMA_REGISTRY_AUTHENTICATION_ROLES
+          value: "admin,readwrite,readonly"                   
+        - name: SCHEMA_REGISTRY_KAFKASTORE_SECURITY_PROTOCOL
+          value: SASL_PLAINTEXT
+        - name: SCHEMA_REGISTRY_KAFKASTORE_SASL_MECHANISM
+          value: SCRAM-SHA-512
+        - name: SCHEMA_REGISTRY_KAFKASTORE_SASL_JAAS_CONFIG
+          valueFrom:
+            secretKeyRef:
+              name: schema-reg-sasl-config
+              key: config
+        - name: SCHEMA_REGISTRY_OPTS
+          value: "-Djava.security.auth.login.config=/etc/schema-registry/jaas-config.config"
+        - name: SCHEMA_REGISTRY_HEAP_OPTS
+          value: "-Xms512M -Xmx512M"
+        - name: JMX_PORT
+          value: "5555"          
+        # - name: SCHEMA_REGISTRY_LOG4J_LOGGERS
+        #   value: "org.apache.kafka=ERROR,io.confluent.rest.exceptions=ERROR"     
+        livenessProbe:
+          failureThreshold: 6
+          initialDelaySeconds: 10
+          periodSeconds: 20
+          successThreshold: 1
+          tcpSocket:
+            port: http
+          timeoutSeconds: 1
+        ports:
+        - containerPort: 8081
+          name: http
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 6
+          initialDelaySeconds: 10
+          periodSeconds: 20
+          successThreshold: 1
+          tcpSocket:
+            port: http
+          timeoutSeconds: 1
+        resources:
+          limits:
+            ephemeral-storage: 1Gi
+            memory: 768Mi
+          requests:
+            cpu: 500m
+            ephemeral-storage: 50Mi
+            memory: 512Mi
+        volumeMounts:
+        - mountPath: /etc/schema-registry/credentials.txt
+          name: credentials
+          subPath: credentials
+
+        - mountPath: /etc/schema-registry/jaas-config.config
+          name: jaas-config
+          subPath: jaas-config
+      volumes:
+      - secret:
+          defaultMode: 420
+          secretName: schema-reg-credentials
+        name: credentials
+
+      - configMap:
+          defaultMode: 420
+          name: schema-reg-jaas-config
+        name: jaas-config
+
+      - name: jmx-config
+        configMap:
+          name: schema-reg-cp-schema-registry-jmx-configmap        
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: schema-reg-jaas-config
+  namespace: kafka 
+data:
+  jaas-config: |
+    SchemaRegistry-Props {
+      org.eclipse.jetty.jaas.spi.PropertyFileLoginModule required
+      file="/etc/schema-registry/credentials.txt"
+      debug="true";
+    };    
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: schema-reg-cp-schema-registry-jmx-configmap
+  namespace: kafka
+  labels:
+    app.kubernetes.io/instance: schema-registry
+    app.kubernetes.io/name: schema-registry
+data:
+  jmx-schema-registry-prometheus.yml: |+
+    jmxUrl: service:jmx:rmi:///jndi/rmi://localhost:5555/jmxrmi
+    lowercaseOutputName: true
+    lowercaseOutputLabelNames: true
+    ssl: false
+    whitelistObjectNames:
+    - kafka.schema.registry:type=jetty-metrics
+    - kafka.schema.registry:type=master-slave-role
+    - kafka.schema.registry:type=jersey-metrics
+    rules:
+    - pattern : 'kafka.schema.registry<type=jetty-metrics>([^:]+):'
+      name: "cp_kafka_schema_registry_jetty_metrics_$1"
+    - pattern : 'kafka.schema.registry<type=master-slave-role>([^:]+):'
+      name: "cp_kafka_schema_registry_master_slave_role"
+    - pattern : 'kafka.schema.registry<type=jersey-metrics>([^:]+):'
+      name: "cp_kafka_schema_registry_jersey_metrics_$1"
+---
+apiVersion: v1
+data:
+  credentials: yourhash
+  #decrypted value: org.apache.kafka.common.security.scram.ScramLoginModule required username=yourusername password=yourpass;
+kind: Secret
+metadata:
+  name: schema-reg-credentials
+  namespace: kafka
+type: Opaque
+---
+apiVersion: v1
+data:
+  config: yourhash
+##decrypted value: |
+### admin: 4egJb0DCao5S2w,admin
+### test: gx1jl82RMGGjU,readwrite
+### test-dev: 4t4LNh7SRx3qh9J,readonly
+kind: Secret
+metadata:
+  name: schema-reg-sasl-config
+  namespace: kafka
+type: Opaque
